@@ -3,31 +3,50 @@ package Java;
 import sun.misc.Unsafe;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.lang.reflect.Field;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.channels.FileChannel.MapMode;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Objects;
-import java.util.TreeMap;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static java.lang.ProcessBuilder.Redirect.PIPE;
-import static java.lang.foreign.ValueLayout.JAVA_BYTE;
-import static java.util.Arrays.asList;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Blog6 {
-    static final int CHUNK_SIZE = 2 * 1024 * 1024;
-    static int chunkCount;
-    static StationStats[][] results;
-    static long baseAddress;
-    static final AtomicInteger chunkSelector = new AtomicInteger();
     private static final Unsafe UNSAFE = unsafe();
+    private static final String MEASUREMENTS_TXT = "measurements.txt";
+    // todo: with hyper-threading enable we would be better of with availableProcessors / 2;
+    // todo: validate the testing env. params.
+    private static final int EXTRA_THREAD_COUNT = Runtime.getRuntime().availableProcessors() - 1;
+    // private static final int THREAD_COUNT = 1;
+
+    private static final long SEPARATOR_PATTERN = 0x3B3B3B3B3B3B3B3BL;
+    private static final long NEW_LINE_PATTERN = 0x0A0A0A0A0A0A0A0AL;
+    private static final int SEGMENT_SIZE = 4 * 1024 * 1024;
+
+    // credits for the idea with lookup tables instead of bit-shifting: abeobk
+    private static final long[] HASH_MASKS = new long[]{
+            0x0000000000000000L, // semicolon is the first char
+            0x00000000000000ffL,
+            0x000000000000ffffL,
+            0x0000000000ffffffL,
+            0x00000000ffffffffL,
+            0x000000ffffffffffL,
+            0x0000ffffffffffffL,
+            0x00ffffffffffffffL, // semicolon is the last char
+            0xffffffffffffffffL // there is no semicolon at all
+    };
+
+    private static final long[] ADVANCE_MASKS = new long[]{
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0x0000000000000000L,
+            0xffffffffffffffffL,
+    };
 
     private static Unsafe unsafe() {
         try {
@@ -40,360 +59,591 @@ public class Blog6 {
         }
     }
 
-    static long getLong(long address) {
-        return UNSAFE.getLong(address);
-    }
-
-    static byte getByte(long address) {
-        return UNSAFE.getByte(address);
-    }
-
     public static void main(String[] args) throws Exception {
-        if (args.length >= 1 && args[0].equals("--worker")) {
-            var start = System.currentTimeMillis();
-            calculate();
-            System.err.format("Took %,d ms\n", System.currentTimeMillis() - start);
-            System.out.close();
+        var clockStart = System.currentTimeMillis();
+        if (args.length == 0 || !("--worker".equals(args[0]))) {
+            spawnWorker();
             return;
         }
-        var curProcInfo = ProcessHandle.current().info();
-        var cmdLine = new ArrayList<String>();
-        cmdLine.add(curProcInfo.command().get());
-        cmdLine.addAll(asList(curProcInfo.arguments().get()));
-        cmdLine.add("--worker");
-        var process = new ProcessBuilder()
-                .command(cmdLine)
-                .inheritIO().redirectOutput(PIPE)
-                .start()
-                .getInputStream().transferTo(System.out);
-
+        calculate();
+        System.err.format("Took %,d ms\n", System.currentTimeMillis() - clockStart);
     }
 
-    private static void calculate() throws Exception {
-        final File file = new File("measurements.txt");
+    private static void spawnWorker() throws IOException {
+        ProcessHandle.Info info = ProcessHandle.current().info();
+        ArrayList<String> workerCommand = new ArrayList<>();
+        info.command().ifPresent(workerCommand::add);
+        info.arguments().ifPresent(args -> workerCommand.addAll(Arrays.asList(args)));
+        workerCommand.add("--worker");
+        new ProcessBuilder()
+                .command(workerCommand)
+                .inheritIO()
+                .redirectOutput(ProcessBuilder.Redirect.PIPE)
+                .start()
+                .getInputStream()
+                .transferTo(System.out);
+    }
+
+    static void calculate() throws Exception {
+        final File file = new File(MEASUREMENTS_TXT);
         final long length = file.length();
-        chunkCount = (int) ((length / CHUNK_SIZE - 1) + 1);
-        var threadCount = Runtime.getRuntime().availableProcessors();
-        results = new StationStats[threadCount][];
         try (var raf = new RandomAccessFile(file, "r")) {
-            final var mappedFile = raf.getChannel().map(MapMode.READ_ONLY, 0, length, Arena.global());
-            baseAddress = mappedFile.address();
-            var threads = new Thread[threadCount];
-            for (int i = 0; i < threadCount; i++) {
-                threads[i] = new Thread(new ChunkProcessor(i));
-            }
-            for (var thread : threads) {
+            long fileStart = raf.getChannel().map(MapMode.READ_ONLY, 0, length, Arena.global()).address();
+            long fileEnd = fileStart + length;
+            var globalCursor = new AtomicLong(fileStart);
+
+            Processor[] processors = new Processor[EXTRA_THREAD_COUNT];
+            Thread[] threads = new Thread[EXTRA_THREAD_COUNT];
+
+            for (int i = 0; i < EXTRA_THREAD_COUNT; i++) {
+                Processor processor = new Processor(fileStart, fileEnd, globalCursor);
+                Thread thread = new Thread(processor);
+                processors[i] = processor;
+                threads[i] = thread;
                 thread.start();
             }
-            for (var thread : threads) {
-                thread.join();
+
+            Processor processor = new Processor(fileStart, fileEnd, globalCursor);
+            processor.run();
+
+            var accumulator = new TreeMap<String, StationStats>();
+            processor.accumulateStatus(accumulator);
+
+            for (int i = 0; i < EXTRA_THREAD_COUNT; i++) {
+                Thread t = threads[i];
+                t.join();
+                processors[i].accumulateStatus(accumulator);
             }
+
+            printResults(accumulator);
         }
-        var totalsMap = new TreeMap<String, StationStats>();
-        for (var statsArray : results) {
-            for (var stats : statsArray) {
-                totalsMap.merge(stats.name, stats, (old, curr) -> {
-                    old.count += curr.count;
-                    old.sum += curr.sum;
-                    old.min = Math.min(old.min, curr.min);
-                    old.max = Math.max(old.max, curr.max);
-                    return old;
-                });
-            }
-        }
-        System.out.println(totalsMap);
     }
 
-    private static class ChunkProcessor implements Runnable {
-        private static final int HASHTABLE_SIZE = 4096;
-        private final int myIndex;
-        private final StatsAcc[] hashtable = new StatsAcc[HASHTABLE_SIZE];
-
-        ChunkProcessor(int myIndex) {
-            this.myIndex = myIndex;
-        }
-
-        @Override public void run() {
-            while (true) {
-                var selectedChunk = chunkSelector.getAndIncrement();
-                if (selectedChunk >= chunkCount) {
-                    break;
-                }
-                var chunkBase = baseAddress + (long) selectedChunk * CHUNK_SIZE;
-                var chunkLimit = baseAddress + (long) (selectedChunk + 1) * CHUNK_SIZE;
-                if (selectedChunk > 0) {
-                    chunkBase--;
-                    while (getByte(chunkBase) != '\n') {
-                        chunkBase++;
-                    }
-                    chunkBase++;
-                }
-                processChunk(chunkBase, chunkLimit);
+    private static void printResults(TreeMap<String, StationStats> accumulator) {
+        var sb = new StringBuilder(10000);
+        boolean first = true;
+        for (Map.Entry<String, StationStats> statsEntry : accumulator.entrySet()) {
+            if (first) {
+                sb.append("{");
+                first = false;
             }
-            results[myIndex] = Arrays
-                    .stream(hashtable)
-                    .filter(Objects::nonNull)
-                    .map(StationStats::new)
-                    .toArray(StationStats[]::new);
-        }
-
-        private void processChunk(long chunkBase, long chunkLimit) {
-            long cursor = chunkBase;
-            long lastNameWord;
-            while (cursor < chunkLimit) {
-                long nameStartOffset = cursor;
-                long nameWord0 = getLong(nameStartOffset);
-                long nameWord1 = getLong(nameStartOffset + Long.BYTES);
-                long matchBits0 = semicolonMatchBits(nameWord0);
-                long matchBits1 = semicolonMatchBits(nameWord1);
-
-                int temperature;
-                StatsAcc acc;
-                long hash;
-                int nameLen;
-                if ((matchBits0 | matchBits1) != 0) {
-                    int nameLen0 = nameLen(matchBits0);
-                    int nameLen1 = nameLen(matchBits1);
-                    nameWord0 = maskWord(nameWord0, matchBits0);
-                    long nameWord1Mask = (long) nameLen0 << 60 >> 63;
-                    nameWord1 = maskWord(nameWord1, matchBits1) & nameWord1Mask;
-                    nameLen1 &= (int) (nameWord1Mask & 0b111);
-                    nameLen = nameLen0 + nameLen1 + 1;
-                    lastNameWord = (nameWord0 & ~nameWord1Mask) | nameWord1;
-
-                    cursor += nameLen;
-                    long tempWord = getLong(cursor);
-                    int dotPos = dotPos(tempWord);
-                    temperature = parseTemperature(tempWord, dotPos);
-
-                    cursor += (dotPos >> 3) + 3;
-                    hash = hash(nameWord0);
-                    acc = findAcc2(hash, nameWord0, nameWord1);
-                    if (acc != null) {
-                        acc.observe(temperature);
-                        continue;
-                    }
-                } else {
-                    hash = hash(nameWord0);
-                    nameLen = 2 * Long.BYTES;
-                    while (true) {
-                        lastNameWord = getLong(nameStartOffset + nameLen);
-                        long matchBits = semicolonMatchBits(lastNameWord);
-                        if (matchBits != 0) {
-                            nameLen += nameLen(matchBits) + 1;
-                            lastNameWord = maskWord(lastNameWord, matchBits);
-                            cursor += nameLen;
-                            long tempWord = getLong(cursor);
-                            int dotPos = dotPos(tempWord);
-                            temperature = parseTemperature(tempWord, dotPos);
-                            cursor += (dotPos >> 3) + 3;
-                            break;
-                        }
-                        nameLen += Long.BYTES;
-                    }
-                }
-                ensureAcc(hash, nameStartOffset, nameLen, nameWord0, nameWord1, lastNameWord).observe(temperature);
+            else {
+                sb.append(", ");
             }
+            var value = statsEntry.getValue();
+            var name = statsEntry.getKey();
+            int min = value.min;
+            int max = value.max;
+            int count = value.count;
+            long sum2 = value.sum;
+            sb.append(String.format("%s=%.1f/%.1f/%.1f", name, min / 10.0, Math.round((double) sum2 / count) / 10.0, max / 10.0));
         }
+        sb.append('}');
+        System.out.println(sb);
+        System.out.close();
+    }
 
-        private StatsAcc findAcc2(long hash, long nameWord0, long nameWord1) {
-            int slotPos = (int) hash & (HASHTABLE_SIZE - 1);
-            var acc = hashtable[slotPos];
-            if (acc != null && acc.hash == hash && acc.nameEquals2(nameWord0, nameWord1)) {
-                return acc;
-            }
-            return null;
-        }
+    public static int ceilPow2(int i) {
+        i--;
+        i |= i >> 1;
+        i |= i >> 2;
+        i |= i >> 4;
+        i |= i >> 8;
+        i |= i >> 16;
+        return i + 1;
+    }
 
-        private StatsAcc ensureAcc(
-                long hash, long nameStartOffset, int nameLen, long nameWord0, long nameWord1, long lastNameWord
-        ) {
-            int initialPos = (int) hash & (HASHTABLE_SIZE - 1);
-            int slotPos = initialPos;
-            while (true) {
-                var acc = hashtable[slotPos];
-                if (acc == null) {
-                    acc = new StatsAcc(hash, nameStartOffset, nameLen, nameWord0, nameWord1, lastNameWord);
-                    hashtable[slotPos] = acc;
-                    return acc;
-                }
-                if (acc.hash == hash && acc.nameEquals(nameStartOffset, nameLen, nameWord0, nameWord1, lastNameWord)) {
-                    return acc;
-                }
-                slotPos = (slotPos + 1) & (HASHTABLE_SIZE - 1);
-                if (slotPos == initialPos) {
-                    throw new RuntimeException(String.format("hash %x, acc.hash %x", hash, acc.hash));
-                }
-            }
-        }
+    private static class Processor implements Runnable {
+        private static final int MAX_UNIQUE_KEYS = 10000;
+        private static final int MAPS_SLOT_COUNT = ceilPow2(MAX_UNIQUE_KEYS);
+        private static final int STATION_MAX_NAME_BYTES = 104;
 
-        private static final long BROADCAST_SEMICOLON = 0x3B3B3B3B3B3B3B3BL;
-        private static final long BROADCAST_0x01 = 0x0101010101010101L;
-        private static final long BROADCAST_0x80 = 0x8080808080808080L;
+        private static final long MAP_COUNT_OFFSET = 0;
+        private static final long MAP_MIN_OFFSET = 4;
+        private static final long MAP_MAX_OFFSET = 8;
+        private static final long MAP_SUM_OFFSET = 12;
+        private static final long MAP_LEN_OFFSET = 20;
+        private static final long SLOW_MAP_NAME_OFFSET = 24;
 
-        private static long semicolonMatchBits(long word) {
-            long diff = word ^ BROADCAST_SEMICOLON;
-            return (diff - BROADCAST_0x01) & (~diff & BROADCAST_0x80);
-        }
+        // private int longestChain = 0;
 
-        // credit: artsiomkorzun
-        private static long maskWord(long word, long matchBits) {
-            long mask = matchBits ^ (matchBits - 1);
-            return word & mask;
-        }
+        private static final int SLOW_MAP_ENTRY_SIZE_BYTES = Integer.BYTES // count // 0
+                + Integer.BYTES // min // +4
+                + Integer.BYTES // max // +8
+                + Long.BYTES // sum // +12
+                + Integer.BYTES // station name len // +20
+                + Long.BYTES; // station name ptr // 24
 
-        private static final long DOT_BITS = 0x10101000;
-        private static final long MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
+        private static final long FAST_MAP_NAME_PART1 = 24;
+        private static final long FAST_MAP_NAME_PART2 = 32;
+
+        private static final int FAST_MAP_ENTRY_SIZE_BYTES = Integer.BYTES // count // 0
+                + Integer.BYTES // min // +4
+                + Integer.BYTES // max // +8
+                + Long.BYTES // sum // +12
+                + Integer.BYTES // station name len // +20
+                + Long.BYTES // station name part 1 // 24
+                + Long.BYTES; // station name part 2 // 32
+
+        private static final int SLOW_MAP_SIZE_BYTES = MAPS_SLOT_COUNT * SLOW_MAP_ENTRY_SIZE_BYTES;
+        private static final int FAST_MAP_SIZE_BYTES = MAPS_SLOT_COUNT * FAST_MAP_ENTRY_SIZE_BYTES;
+        private static final int SLOW_MAP_MAP_NAMES_BYTES = MAX_UNIQUE_KEYS * STATION_MAX_NAME_BYTES;
+        private static final int MAP_MASK = MAPS_SLOT_COUNT - 1;
+        private final AtomicLong globalCursor;
+
+        private long slowMap;
+        private long slowMapNamesPtr;
+        private long cursorA;
+        private long endA;
+        private long cursorB;
+        private long endB;
+        private HashMap<String, StationStats> stats = new HashMap<>(1000);
+        private final long fileEnd;
+        private final long fileStart;
 
         // credit: merykitty
-        // Bit 4 of the ascii of a digit is 1, while that of '.' is 0.
-        // This finds the decimal separator. The value can be 12, 20, 28.
-        private static int dotPos(long word) {
-            return Long.numberOfTrailingZeros(~word & DOT_BITS);
+        private long parseAndStoreTemperature(long startCursor, long baseEntryPtr, long word) {
+            long countPtr = baseEntryPtr + MAP_COUNT_OFFSET;
+            int cnt = UNSAFE.getInt(countPtr);
+            UNSAFE.putInt(countPtr, cnt + 1);
+
+            long minPtr = baseEntryPtr + MAP_MIN_OFFSET;
+            long maxPtr = baseEntryPtr + MAP_MAX_OFFSET;
+            long sumPtr = baseEntryPtr + MAP_SUM_OFFSET;
+
+            int min = UNSAFE.getInt(minPtr);
+            int max = UNSAFE.getInt(maxPtr);
+            long sum = UNSAFE.getLong(sumPtr);
+
+            final long negateda = ~word;
+            final int dotPos = Long.numberOfTrailingZeros(negateda & 0x10101000);
+            final long signed = (negateda << 59) >> 63;
+            final long removeSignMask = ~(signed & 0xFF);
+            final long digits = ((word & removeSignMask) << (28 - dotPos)) & 0x0F000F0F00L;
+            final long absValue = ((digits * 0x640a0001) >>> 32) & 0x3FF;
+            final int temperature = (int) ((absValue ^ signed) - signed);
+            sum += temperature;
+            UNSAFE.putLong(sumPtr, sum);
+
+            if (temperature > max) {
+                UNSAFE.putInt(maxPtr, temperature);
+            }
+            if (temperature < min) {
+                UNSAFE.putInt(minPtr, temperature);
+            }
+            return startCursor + (dotPos / 8) + 3;
         }
 
-        // credit: merykitty and royvanrijn
-        private static int parseTemperature(long numberBytes, int dotPos) {
-            // numberBytes contains the number: X.X, -X.X, XX.X or -XX.X
-            final long invNumberBytes = ~numberBytes;
-
-            // Calculates the sign
-            final long signed = (invNumberBytes << 59) >> 63;
-            final int _28MinusDotPos = (dotPos ^ 0b11100);
-            final long minusFilter = ~(signed & 0xFF);
-            // Use the pre-calculated decimal position to adjust the values
-            final long digits = ((numberBytes & minusFilter) << _28MinusDotPos) & 0x0F000F0F00L;
-
-            // Multiply by a magic (100 * 0x1000000 + 10 * 0x10000 + 1), to get the result
-            final long absValue = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
-            // And apply sign
-            return (int) ((absValue + signed) ^ signed);
+        private static long getDelimiterMask(final long word) {
+            // credit royvanrijn
+            final long match = word ^ SEPARATOR_PATTERN;
+            return (match - 0x0101010101010101L) & (~match & 0x8080808080808080L);
         }
 
-        private static int nameLen(long separator) {
-            return (Long.numberOfTrailingZeros(separator) >>> 3);
-        }
+        void accumulateStatus(TreeMap<String, StationStats> accumulator) {
+            for (Map.Entry<String, StationStats> entry : stats.entrySet()) {
+                String name = entry.getKey();
+                StationStats localStats = entry.getValue();
 
-        private static long hash(long word) {
-            return Long.rotateLeft(word * 0x51_7c_c1_b7_27_22_0a_95L, 17);
-        }
-    }
-
-    static class StatsAcc {
-        private static final long[] emptyTail = new long[0];
-
-        long nameWord0;
-        long nameWord1;
-        long[] nameTail;
-        long hash;
-        int nameLen;
-        int sum;
-        int count;
-        int min;
-        int max;
-
-        public StatsAcc(long hash, long nameStartOffset, int nameLen, long nameWord0, long nameWord1, long lastNameWord) {
-            this.hash = hash;
-            this.nameLen = nameLen;
-            this.nameWord0 = nameWord0;
-            this.nameWord1 = nameWord1;
-            int nameTailLen = (nameLen - 1) / 8 - 1;
-            if (nameTailLen > 0) {
-                nameTail = new long[nameTailLen];
-                int i = 0;
-                for (; i < nameTailLen - 1; i++) {
-                    nameTail[i] = getLong(nameStartOffset + (i + 2L) * Long.BYTES);
+                StationStats globalStats = accumulator.get(name);
+                if (globalStats == null) {
+                    accumulator.put(name, localStats);
                 }
-                nameTail[i] = lastNameWord;
-            } else {
-                nameTail = emptyTail;
+                else {
+                    accumulator.put(name, globalStats.mergeWith(localStats));
+                }
             }
         }
 
-        boolean nameEquals2(long nameWord0, long nameWord1) {
-            return this.nameWord0 == nameWord0 && this.nameWord1 == nameWord1;
+        Processor(long fileStart, long fileEnd, AtomicLong globalCursor) {
+            this.globalCursor = globalCursor;
+            this.fileEnd = fileEnd;
+            this.fileStart = fileStart;
         }
 
-        private static final int NAMETAIL_OFFSET = 2 * Long.BYTES;
+        private void transferToHeap(long fastMap) {
+            for (long baseAddress = slowMap; baseAddress < slowMap + SLOW_MAP_SIZE_BYTES; baseAddress += SLOW_MAP_ENTRY_SIZE_BYTES) {
+                long len = UNSAFE.getInt(baseAddress + MAP_LEN_OFFSET);
+                if (len == 0) {
+                    continue;
+                }
+                byte[] nameArr = new byte[(int) len];
+                long baseNameAddr = UNSAFE.getLong(baseAddress + SLOW_MAP_NAME_OFFSET);
+                for (int i = 0; i < len; i++) {
+                    nameArr[i] = UNSAFE.getByte(baseNameAddr + i);
+                }
+                String name = new String(nameArr);
+                int min = UNSAFE.getInt(baseAddress + MAP_MIN_OFFSET);
+                int max = UNSAFE.getInt(baseAddress + MAP_MAX_OFFSET);
+                int count = UNSAFE.getInt(baseAddress + MAP_COUNT_OFFSET);
+                long sum = UNSAFE.getLong(baseAddress + MAP_SUM_OFFSET);
 
-        boolean nameEquals(
-                long inputNameStart, long inputNameLen, long inputWord0, long inputWord1, long lastInputWord
-        ) {
-            boolean mismatch0 = inputWord0 != nameWord0;
-            boolean mismatch1 = inputWord1 != nameWord1;
-            boolean mismatch = mismatch0 | mismatch1;
-            if (mismatch | inputNameLen <= NAMETAIL_OFFSET) {
-                return !mismatch;
+                stats.put(name, new StationStats(min, max, count, sum));
             }
-            int i = NAMETAIL_OFFSET;
-            for (; i <= inputNameLen - Long.BYTES; i += Long.BYTES) {
-                if (getLong(inputNameStart + i) != nameTail[(i - NAMETAIL_OFFSET) / 8]) {
+
+            for (long baseAddress = fastMap; baseAddress < fastMap + FAST_MAP_SIZE_BYTES; baseAddress += FAST_MAP_ENTRY_SIZE_BYTES) {
+                long len = UNSAFE.getInt(baseAddress + MAP_LEN_OFFSET);
+                if (len == 0) {
+                    continue;
+                }
+                byte[] nameArr = new byte[(int) len];
+                long baseNameAddr = baseAddress + FAST_MAP_NAME_PART1;
+                for (int i = 0; i < len; i++) {
+                    nameArr[i] = UNSAFE.getByte(baseNameAddr + i);
+                }
+                String name = new String(nameArr);
+                int min = UNSAFE.getInt(baseAddress + MAP_MIN_OFFSET);
+                int max = UNSAFE.getInt(baseAddress + MAP_MAX_OFFSET);
+                int count = UNSAFE.getInt(baseAddress + MAP_COUNT_OFFSET);
+                long sum = UNSAFE.getLong(baseAddress + MAP_SUM_OFFSET);
+
+                var v = stats.get(name);
+                if (v == null) {
+                    stats.put(name, new StationStats(min, max, count, sum));
+                }
+                else {
+                    stats.put(name, new StationStats(Math.min(v.min, min), Math.max(v.max, max), v.count + count, v.sum + sum));
+                }
+            }
+        }
+
+        private void doOne(long cursor, long end, long fastMap) {
+            while (cursor < end) {
+                // it seems that when pulling just from a single chunk
+                // then bit-twiddling is faster than lookup tables
+                // hypothesis: when processing multiple things at once then LOAD latency is partially hidden
+                // but when processing just one thing then it's better to keep things local as much as possible? maybe:)
+
+                long start = cursor;
+                long currentWord = UNSAFE.getLong(cursor);
+                long mask = getDelimiterMask(currentWord);
+                long firstWordMask = ((mask - 1) ^ mask) >>> 8;
+                final long isMaskZeroA = ((mask | -mask) >>> 63) ^ 1;
+                long ext = -isMaskZeroA;
+                firstWordMask |= ext;
+
+                long maskedFirstWord = currentWord & firstWordMask;
+                int hash = hash(maskedFirstWord);
+                int mapIndex = hash & MAP_MASK;
+                while (mask == 0) {
+                    cursor += 8;
+                    currentWord = UNSAFE.getLong(cursor);
+                    mask = getDelimiterMask(currentWord);
+                }
+                final int delimiterByte = Long.numberOfTrailingZeros(mask);
+                final long semicolon = cursor + (delimiterByte >> 3);
+                final long maskedWord = currentWord & ((mask - 1) ^ mask) >>> 8;
+
+                int len = (int) (semicolon - start);
+                if (len > 15) {
+                    long baseEntryPtr = getOrCreateEntryBaseOffsetSlow(len, start, hash, maskedWord);
+                    long temperatureWord = UNSAFE.getLong(semicolon + 1);
+                    cursor = parseAndStoreTemperature(semicolon + 1, baseEntryPtr, temperatureWord);
+                }
+                else {
+                    long baseEntryPtr = getOrCreateEntryBaseOffsetFast(mapIndex, len, maskedWord, maskedFirstWord, fastMap);
+                    long temperatureWord = UNSAFE.getLong(semicolon + 1);
+                    cursor = parseAndStoreTemperature(semicolon + 1, baseEntryPtr, temperatureWord);
+                }
+            }
+        }
+
+        private static int hash(long word) {
+            // credit: mtopolnik
+            long seed = 0x51_7c_c1_b7_27_22_0a_95L;
+            int rotDist = 17;
+            //
+            long hash = word;
+            hash *= seed;
+            hash = Long.rotateLeft(hash, rotDist);
+            return (int) hash;
+        }
+
+        private static long nextNewLine(long prev) {
+            // again: credits to @thomaswue for this code, literally copy'n'paste
+            while (true) {
+                long currentWord = UNSAFE.getLong(prev);
+                long input = currentWord ^ NEW_LINE_PATTERN;
+                long pos = (input - 0x0101010101010101L) & ~input & 0x8080808080808080L;
+                if (pos != 0) {
+                    prev += Long.numberOfTrailingZeros(pos) >>> 3;
+                    break;
+                }
+                else {
+                    prev += 8;
+                }
+            }
+            return prev;
+        }
+
+        @Override
+        public void run() {
+            long fastMap = allocateMem();
+            for (;;) {
+                long startingPtr = globalCursor.addAndGet(SEGMENT_SIZE) - SEGMENT_SIZE;
+                if (startingPtr >= fileEnd) {
+                    break;
+                }
+                setCursors(startingPtr);
+                mainLoop(fastMap);
+                doOne(cursorA, endA, fastMap);
+                doOne(cursorB, endB, fastMap);
+            }
+            transferToHeap(fastMap);
+        }
+
+        private long allocateMem() {
+            this.slowMap = UNSAFE.allocateMemory(SLOW_MAP_SIZE_BYTES);
+            this.slowMapNamesPtr = UNSAFE.allocateMemory(SLOW_MAP_MAP_NAMES_BYTES);
+            long fastMap = UNSAFE.allocateMemory(FAST_MAP_SIZE_BYTES);
+            UNSAFE.setMemory(slowMap, SLOW_MAP_SIZE_BYTES, (byte) 0);
+            UNSAFE.setMemory(fastMap, FAST_MAP_SIZE_BYTES, (byte) 0);
+            UNSAFE.setMemory(slowMapNamesPtr, SLOW_MAP_MAP_NAMES_BYTES, (byte) 0);
+            return fastMap;
+        }
+
+        private void mainLoop(long fastMap) {
+            while (cursorA < endA && cursorB < endB) {
+                long currentWordA = UNSAFE.getLong(cursorA);
+                long currentWordB = UNSAFE.getLong(cursorB);
+
+                long delimiterMaskA = getDelimiterMask(currentWordA);
+                long delimiterMaskB = getDelimiterMask(currentWordB);
+
+                long candidateWordA = UNSAFE.getLong(cursorA + 8);
+                long candidateWordB = UNSAFE.getLong(cursorB + 8);
+
+                long startA = cursorA;
+                long startB = cursorB;
+
+                int trailingZerosA = Long.numberOfTrailingZeros(delimiterMaskA) >> 3;
+                int trailingZerosB = Long.numberOfTrailingZeros(delimiterMaskB) >> 3;
+
+                long advanceMaskA = ADVANCE_MASKS[trailingZerosA];
+                long advanceMaskB = ADVANCE_MASKS[trailingZerosB];
+
+                long wordMaskA = HASH_MASKS[trailingZerosA];
+                long wordMaskB = HASH_MASKS[trailingZerosB];
+
+                long maskedMaskA = advanceMaskA & 8;
+                long maskedMaskB = advanceMaskB & 8;
+
+                long negAdvanceMaskA = ~advanceMaskA;
+                long negAdvanceMaskB = ~advanceMaskB;
+
+                cursorA += maskedMaskA;
+                cursorB += maskedMaskB;
+
+                long nextWordA = (advanceMaskA & candidateWordA) | (negAdvanceMaskA & currentWordA);
+                long nextWordB = (advanceMaskB & candidateWordB) | (negAdvanceMaskB & currentWordB);
+
+                delimiterMaskA = getDelimiterMask(nextWordA);
+                delimiterMaskB = getDelimiterMask(nextWordB);
+
+                boolean slowA = delimiterMaskA == 0;
+                boolean slowB = delimiterMaskB == 0;
+                trailingZerosA = Long.numberOfTrailingZeros(delimiterMaskA) >> 3;
+                trailingZerosB = Long.numberOfTrailingZeros(delimiterMaskB) >> 3;
+                boolean slowSome = (slowA || slowB);
+
+                long maskedFirstWordA = wordMaskA & currentWordA;
+                long maskedFirstWordB = wordMaskB & currentWordB;
+
+                int hashA = hash(maskedFirstWordA);
+                int hashB = hash(maskedFirstWordB);
+
+                currentWordA = nextWordA;
+                currentWordB = nextWordB;
+
+                if (slowSome) {
+                    doSlow(fastMap, delimiterMaskA, currentWordA, delimiterMaskB, currentWordB, startA, startB, hashA, hashB, slowA, maskedFirstWordA, slowB,
+                            maskedFirstWordB);
+                }
+                else {
+                    final long semicolonA = cursorA + trailingZerosA;
+                    final long semicolonB = cursorB + trailingZerosB;
+
+                    long digitStartA = semicolonA + 1;
+                    long digitStartB = semicolonB + 1;
+
+                    long lastWordMaskA = HASH_MASKS[trailingZerosA];
+                    long lastWordMaskB = HASH_MASKS[trailingZerosB];
+
+                    long temperatureWordA = UNSAFE.getLong(digitStartA);
+                    long temperatureWordB = UNSAFE.getLong(digitStartB);
+
+                    final long maskedLastWordA = currentWordA & lastWordMaskA;
+                    final long maskedLastWordB = currentWordB & lastWordMaskB;
+
+                    int lenA = (int) (semicolonA - startA);
+                    int lenB = (int) (semicolonB - startB);
+
+                    int mapIndexA = hashA & MAP_MASK;
+                    int mapIndexB = hashB & MAP_MASK;
+
+                    long baseEntryPtrA;
+                    long baseEntryPtrB;
+
+                    baseEntryPtrA = getOrCreateEntryBaseOffsetFast(mapIndexA, lenA, maskedLastWordA, maskedFirstWordA, fastMap);
+                    baseEntryPtrB = getOrCreateEntryBaseOffsetFast(mapIndexB, lenB, maskedLastWordB, maskedFirstWordB, fastMap);
+
+                    cursorA = parseAndStoreTemperature(digitStartA, baseEntryPtrA, temperatureWordA);
+                    cursorB = parseAndStoreTemperature(digitStartB, baseEntryPtrB, temperatureWordB);
+                }
+            }
+        }
+
+        private void doSlow(long fastMap, long delimiterMaskA, long currentWordA, long delimiterMaskB, long currentWordB, long startA, long startB, int hashA, int hashB,
+                            boolean slowA, long maskedFirstWordA, boolean slowB, long maskedFirstWordB) {
+            int trailingZerosB;
+            int trailingZerosA;
+            while (delimiterMaskA == 0) {
+                cursorA += 8;
+                currentWordA = UNSAFE.getLong(cursorA);
+                delimiterMaskA = getDelimiterMask(currentWordA);
+            }
+
+            while (delimiterMaskB == 0) {
+                cursorB += 8;
+                currentWordB = UNSAFE.getLong(cursorB);
+                delimiterMaskB = getDelimiterMask(currentWordB);
+            }
+            trailingZerosA = Long.numberOfTrailingZeros(delimiterMaskA) >> 3;
+            trailingZerosB = Long.numberOfTrailingZeros(delimiterMaskB) >> 3;
+
+            final long semicolonA = cursorA + trailingZerosA;
+            final long semicolonB = cursorB + trailingZerosB;
+
+            long digitStartA = semicolonA + 1;
+            long digitStartB = semicolonB + 1;
+
+            long lastWordMaskA = HASH_MASKS[trailingZerosA];
+            long lastWordMaskB = HASH_MASKS[trailingZerosB];
+
+            long temperatureWordA = UNSAFE.getLong(digitStartA);
+            long temperatureWordB = UNSAFE.getLong(digitStartB);
+
+            final long maskedLastWordA = currentWordA & lastWordMaskA;
+            final long maskedLastWordB = currentWordB & lastWordMaskB;
+
+            int lenA = (int) (semicolonA - startA);
+            int lenB = (int) (semicolonB - startB);
+
+            int mapIndexA = hashA & MAP_MASK;
+            int mapIndexB = hashB & MAP_MASK;
+
+            long baseEntryPtrA;
+            long baseEntryPtrB;
+
+            if (slowA) {
+                baseEntryPtrA = getOrCreateEntryBaseOffsetSlow(lenA, startA, hashA, maskedLastWordA);
+            }
+            else {
+                baseEntryPtrA = getOrCreateEntryBaseOffsetFast(mapIndexA, lenA, maskedLastWordA, maskedFirstWordA, fastMap);
+            }
+
+            if (slowB) {
+                baseEntryPtrB = getOrCreateEntryBaseOffsetSlow(lenB, startB, hashB, maskedLastWordB);
+            }
+            else {
+                baseEntryPtrB = getOrCreateEntryBaseOffsetFast(mapIndexB, lenB, maskedLastWordB, maskedFirstWordB, fastMap);
+            }
+            cursorA = parseAndStoreTemperature(digitStartA, baseEntryPtrA, temperatureWordA);
+            cursorB = parseAndStoreTemperature(digitStartB, baseEntryPtrB, temperatureWordB);
+        }
+
+        private void setCursors(long current) {
+            // Credit for the whole work-stealing scheme: @thomaswue
+            // I have totally stolen it from him. I changed the order a bit to suite my taste better,
+            // but it's his code
+            long segmentStart;
+            if (current == fileStart) {
+                segmentStart = current;
+            }
+            else {
+                segmentStart = nextNewLine(current) + 1;
+            }
+            long segmentEnd = nextNewLine(Math.min(fileEnd - 1, current + SEGMENT_SIZE));
+
+            long size = (segmentEnd - segmentStart) / 2;
+            long mid = nextNewLine(segmentStart + size);
+
+            cursorA = segmentStart;
+            endA = mid;
+            cursorB = mid + 1;
+            endB = segmentEnd;
+        }
+
+        private static long getOrCreateEntryBaseOffsetFast(int mapIndexA, int lenA, long maskedLastWord, long maskedFirstWord, long fastMap) {
+            for (;;) {
+                long basePtr = mapIndexA * FAST_MAP_ENTRY_SIZE_BYTES + fastMap;
+                long namePart1 = UNSAFE.getLong(basePtr + FAST_MAP_NAME_PART1);
+                long namePart2 = UNSAFE.getLong(basePtr + FAST_MAP_NAME_PART2);
+                if (namePart1 == maskedFirstWord && namePart2 == maskedLastWord) {
+                    return basePtr;
+                }
+                long lenPtr = basePtr + MAP_LEN_OFFSET;
+                int len = UNSAFE.getInt(lenPtr);
+                if (len == 0) {
+                    return newEntryFast(lenA, maskedLastWord, maskedFirstWord, lenPtr, basePtr);
+                }
+                mapIndexA = ++mapIndexA & MAP_MASK;
+            }
+        }
+
+        private static long newEntryFast(int lenA, long maskedLastWord, long maskedFirstWord, long lenPtr, long basePtr) {
+            UNSAFE.putInt(lenPtr, lenA);
+            // todo: this could be a single putLong()
+            UNSAFE.putInt(basePtr + MAP_MAX_OFFSET, Integer.MIN_VALUE);
+            UNSAFE.putInt(basePtr + MAP_MIN_OFFSET, Integer.MAX_VALUE);
+            UNSAFE.putLong(basePtr + FAST_MAP_NAME_PART1, maskedFirstWord);
+            UNSAFE.putLong(basePtr + FAST_MAP_NAME_PART2, maskedLastWord);
+            return basePtr;
+        }
+
+        private long getOrCreateEntryBaseOffsetSlow(int lenA, long startPtr, int hash, long maskedLastWord) {
+            long fullLen = lenA & ~7L;
+            long mapIndexA = hash & MAP_MASK;
+            for (;;) {
+                long basePtr = mapIndexA * SLOW_MAP_ENTRY_SIZE_BYTES + slowMap;
+                long lenPtr = basePtr + MAP_LEN_OFFSET;
+                long namePtr = basePtr + SLOW_MAP_NAME_OFFSET;
+                int len = UNSAFE.getInt(lenPtr);
+                if (len == lenA) {
+                    namePtr = UNSAFE.getLong(basePtr + SLOW_MAP_NAME_OFFSET);
+                    if (nameMatchSlow(startPtr, namePtr, fullLen, maskedLastWord)) {
+                        return basePtr;
+                    }
+                }
+                else if (len == 0) {
+                    UNSAFE.putLong(namePtr, slowMapNamesPtr);
+                    UNSAFE.putInt(lenPtr, lenA);
+                    UNSAFE.putInt(basePtr + MAP_MAX_OFFSET, Integer.MIN_VALUE);
+                    UNSAFE.putInt(basePtr + MAP_MIN_OFFSET, Integer.MAX_VALUE);
+                    UNSAFE.copyMemory(startPtr, slowMapNamesPtr, lenA);
+                    long alignedLen = (lenA & ~7L) + 8;
+                    slowMapNamesPtr += alignedLen;
+                    return basePtr;
+                }
+                mapIndexA = ++mapIndexA & MAP_MASK;
+            }
+        }
+
+        private static boolean nameMatchSlow(long start, long namePtr, long fullLen, long maskedLastWord) {
+            long offset;
+            for (offset = 0; offset < fullLen; offset += 8) {
+                if (UNSAFE.getLong(start + offset) != UNSAFE.getLong(namePtr + offset)) {
                     return false;
                 }
             }
-            return i == inputNameLen || lastInputWord == nameTail[(i - NAMETAIL_OFFSET) / 8];
-        }
-
-        void observe(int temperature) {
-            sum += temperature;
-            count++;
-            min = Math.min(min, temperature);
-            max = Math.max(max, temperature);
-        }
-
-        String exportNameString() {
-            var buf = ByteBuffer.allocate((2 + nameTail.length) * 8).order(ByteOrder.LITTLE_ENDIAN);
-            buf.putLong(nameWord0);
-            buf.putLong(nameWord1);
-            for (long nameWord : nameTail) {
-                buf.putLong(nameWord);
-            }
-            buf.flip();
-            final var bytes = new byte[nameLen - 1];
-            buf.get(bytes);
-            return new String(bytes, StandardCharsets.UTF_8);
+            long maskedWordInMap = UNSAFE.getLong(namePtr + fullLen);
+            return (maskedWordInMap == maskedLastWord);
         }
     }
 
-    static class StationStats implements Comparable<StationStats> {
-        String name;
-        long sum;
-        int count;
-        int min;
-        int max;
-
-        StationStats(StatsAcc acc) {
-            name = acc.exportNameString();
-            sum = acc.sum;
-            count = acc.count;
-            min = acc.min;
-            max = acc.max;
+    record StationStats(int min, int max, int count, long sum) {
+        StationStats mergeWith(StationStats other) {
+            return new StationStats(Math.min(min, other.min), Math.max(max, other.max), count + other.count, sum + other.sum);
         }
-
-        @Override
-        public String toString() {
-            return String.format("%.1f/%.1f/%.1f", min / 10.0, Math.round((double) sum / count) / 10.0, max / 10.0);
-        }
-
-        @Override
-        public boolean equals(Object that) {
-            return that.getClass() == StationStats.class && ((StationStats) that).name.equals(this.name);
-        }
-
-        @Override
-        public int compareTo(StationStats that) {
-            return name.compareTo(that.name);
-        }
-    }
-
-    static String stringAt(MemorySegment chunk, long start, long len) {
-        return new String(chunk.asSlice(start, len).toArray(JAVA_BYTE), StandardCharsets.UTF_8);
-    }
-
-    static String longToString(long word) {
-        final ByteBuffer buf = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder());
-        buf.clear();
-        buf.putLong(word);
-        return new String(buf.array(), StandardCharsets.UTF_8);
     }
 }
