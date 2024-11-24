@@ -15,19 +15,21 @@ Nhiệm vụ: phân tích và tổng hợp dữ liệu nhiệt độ từ một 
 |5|Thái Đoàn Trường|B22DCCN488|
 
 ## 2. Nội dung
+Slide trình bày: [link](https://www.canva.com/design/DAGXOJcndbA/hmJ9pibEqPZkxi16XVDEmg/edit?utm_content=DAGXOJcndbA&utm_campaign=designshare&utm_medium=link2&utm_source=sharebutton).
+
 |Phần|Nội dung|Phụ trách|Link|
 |---|---|---|---|
 |1|Giới thiệu đề tài|Giang|[Introduce](https://docs.google.com/document/d/1byyW0y2JiM_cmBuKfdakkTefFMRQGGc-xePNEp1soLk/edit?fbclid=IwZXh0bgNhZW0CMTEAAR3MdyGmkxiKTXUi2nq4YANsLmNNW9_rt_dY_jfyNqwqaqns-LhkL-Jyrzc_aem_W0tH850ptOlu-vzdfjo4tw&tab=t.0)|
 |2.1|Cách tiếp cận cơ bản|Giang|[Basic approach](https://docs.google.com/document/d/1byyW0y2JiM_cmBuKfdakkTefFMRQGGc-xePNEp1soLk/edit?fbclid=IwZXh0bgNhZW0CMTEAAR3MdyGmkxiKTXUi2nq4YANsLmNNW9_rt_dY_jfyNqwqaqns-LhkL-Jyrzc_aem_W0tH850ptOlu-vzdfjo4tw&tab=t.0)|
 |2.2|Sử dụng đa luồng|Trường|[Multiprocess](https://docs.google.com/document/d/15itUwXk6Wu21kn5Exbf-vWlZXGvgGRPtlX71cv8NJZs/edit?fbclid=IwZXh0bgNhZW0CMTEAAR3OKYUs9NWBc2pwzPvkzGNg6p_Ah21MgYZ9USLyWi3vnobu30Ud_P_HARg_aem_fyQo1di23I5EAJXl4gMElA&tab=t.0#heading=h.8350c5r69s8f)|
-|2.3|Các bước tối ưu chương trình|Tiến|[Optimization]()|
+|2.3|Các bước tối ưu chương trình|Tiến|[Optimization](https://github.com/Hecker-Chuoi/BTL_Python/blob/main/doc/optimization.md)|
 |2.4|Sử dụng external libraries|Chính|[External libraries](https://docs.google.com/document/d/1fDtjwv2iUcF5O6jBFLNuziNW98ejdb0dNir-Lngdi4s/edit?hl=vi&fbclid=IwZXh0bgNhZW0CMTEAAR0OGsz7sHU0MWY89ExOtUUUvEvRNqPz12eyQr0ZCb2IxbFQIxuxAomCm24_aem_z819w2sh61GrlC7tnLoY_A&tab=t.0#heading=h.sp7dwac2v0xv)|
 |3|So sánh với ngôn ngữ khác|Minh Anh|[Compare with Java](https://docs.google.com/document/d/1DuAyR36lFnTOveXDlVqbo4V1YBjHtmGBKDTPDLbWxro/edit?fbclid=IwZXh0bgNhZW0CMTEAAR0hb9MFG6tFWUuFpcBdjfssB5oR9X0yKaNpyADcUnPNMmt3w_0mBuvta9o_aem_3N_QabSzVOq0SkvofigYzA&tab=t.0)|
 |4|Hướng phát triển tiếp theo|Minh Anh|[Next step](https://docs.google.com/document/d/1DuAyR36lFnTOveXDlVqbo4V1YBjHtmGBKDTPDLbWxro/edit?fbclid=IwZXh0bgNhZW0CMTEAAR0hb9MFG6tFWUuFpcBdjfssB5oR9X0yKaNpyADcUnPNMmt3w_0mBuvta9o_aem_3N_QabSzVOq0SkvofigYzA&tab=t.0)|
 
 ## 3. Cấu trúc dự án
 ```plain text
-│   README.md                           # File mô tả
+│   README.md                           # Mô tả dự án
 │
 ├───Java solution
 │       Blog1.java                      # Basic approach sử dụng Java
@@ -65,5 +67,5 @@ Cài đặt CPython, Pypy, Java JDK.
     ```
 *Lưu ý: chọn phân vùng có dung lượng trống >= 15Gb.*
 
-**Chạy chương trình**
+**Chạy chương trình**  
 Chạy và kiểm nghiệm trên thực tế tốc độ các solution Java và Python.
