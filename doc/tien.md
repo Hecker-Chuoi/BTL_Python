@@ -55,16 +55,10 @@ So sánh hiệu suất: <Thêm hình ảnh>
 
 ## Bước 3: Lưu nhiệt độ bằng kiểu int thay vì float
 From: 
-```python
-location, measurement = line.split(b";")
-measurement = float(measurement)
-```
+![alt text](image-8.png)
 
 To:
-```python
-location, s = line.split(b";")
-measurement = int(s[:-3] + s[-2:])
-```
+![alt text](image-9.png)
 
 Việc sử dụng kiểu int nhanh hơn so với để ở kiểu float vì:
 + Chuyển đổi kiểu dữ liệu nhanh hơn: khi ép kiểu sang float thì Python phải xác định phần nguyên và phần thập phân, ngoài ra cần xử lý thêm số mũ (nếu có).
