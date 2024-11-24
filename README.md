@@ -1,5 +1,12 @@
 # BTL Python: ONE BILLION ROW CHALLENGE (1BRC)
 
+- [BTL Python: ONE BILLION ROW CHALLENGE (1BRC)](#btl-python-one-billion-row-challenge-1brc)
+  - [1. Giới thiệu](#1-giới-thiệu)
+  - [2. Nội dung](#2-nội-dung)
+  - [3. Cấu trúc dự án](#3-cấu-trúc-dự-án)
+  - [4. Hướng dẫn cài đặt](#4-hướng-dẫn-cài-đặt)
+  - [5. References](#5-references)
+
 ## 1. Giới thiệu
 One Billion Row Challenge (1BRC) là một cuộc thi công nghệ được tổ chức vào T1/2024, nhằm kiểm tra hiệu suất và khả năng tối ưu hóa sử dụng ngôn ngữ Java khi xử lý một tập dữ liệu khổng lồ.
 
@@ -69,3 +76,17 @@ Cài đặt CPython, Pypy, Java JDK.
 
 **Chạy chương trình**  
 Chạy và kiểm nghiệm trên thực tế tốc độ các solution Java và Python.
+
+## 5. References
+* https://1brc.dev/#%F0%9F%92%AA-the-challenge  
+* https://www.morling.dev/blog/one-billion-row-challenge/  
+* https://www.morling.dev/blog/1brc-results-are-in/  
+* https://www.youtube.com/watch?v=utTaPW32gKY  
+* https://www.linkedin.com/pulse/from-minutes-seconds-supercharging-python-billion-row-krishan-gupta-2icfe/  
+* https://jszafran.dev/posts/how-pypy-impacts-the-performance-1br-challenge/  
+* https://github.com/ifnesi/1brc/tree/main  
+* https://www.infoq.com/news/2024/01/1brc-fast-java-processing/  
+* https://towardsdatascience.com/python-one-billion-row-challenge-from-10-minutes-to-4-seconds-0718662b303e  
+* https://questdb.io/blog/billion-row-challenge-step-by-step/  
+* https://medium.com/arcticdb/the-1-billion-row-challenge-1brc-on-arcticdb-a31c070af000  
+* https://benhoyt.com/writings/go-1brc/  
